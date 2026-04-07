@@ -1,0 +1,433 @@
+name: Build Stock OnePlus Kernel
+on:
+  workflow_dispatch:
+    inputs:
+      FILE:
+        type: choice
+        description: "配置文件"
+        required: true
+        default: oneplus_ace2_pro_b
+        options:
+          - oneplus_nord_n30_se_5g_v
+          - oneplus_10r_v
+          - oneplus_nord_3_v
+          - oneplus_ace_v
+          - oneplus_ace_race_v
+          - oneplus_10_pro_b
+          - oneplus_10t_v
+          - oneplus_11r_b
+          - oneplus_ace2_b
+          - oneplus_pad_lite_b
+          - oneplus_pad_mt6983_b
+          - oneplus_ace_2v_b
+          - oneplus_ace_pro_v
+          - oneplus_11_b
+          - oneplus_12r_b
+          - oneplus_ace2_pro_b
+          - oneplus_ace3_b
+          - oneplus_open_b
+          - oneplus_nord_ce4_b
+          - oneplus_12_b
+          - oneplus_pad_go_2_b
+          - oneplus_nord_ce4_lite_5g_b
+          - oneplus_turbo_6v
+          - oneplus_nord_4_b
+          - oneplus_ace_3v_b
+          - oneplus_pad_mt6897_b
+          - oneplus_13r_b
+          - oneplus_ace3_pro_b
+          - oneplus_ace5_b
+          - oneplus_pad_pro_b
+          - oneplus_pad2_b
+          - oneplus_nord_ce5_b
+          - oneplus_nord_5_b
+          - oneplus_ace5_pro_b
+          - oneplus_13_b
+          - oneplus_13t_b
+          - oneplus_13s_b
+          - oneplus_pad_2_pro_b
+          - oneplus_pad_3_b
+          - oneplus_ace5_race_b
+          - oneplus_ace5_ultra_b
+          - oneplus_ace5_ultra_bak_b
+          - oneplus_pad2_mt6991_b
+          - oneplus_ace_6
+          - oneplus_turbo_6
+          - oneplus_ace_6t
+          - oneplus_ace_6t_aosp
+          - oneplus_15r
+          - oneplus_15r_aosp
+          - oneplus_15
+          - oneplus_15_aosp
+          - oneplus_15t
+          - oneplus_15t_aosp
+      DYNAMIC_REPO:
+        type: string
+        description: "动态清单仓库所有者"
+        required: true
+        default: "Numbersf"
+      FAST_BUILD:
+        type: boolean
+        description: "是否启用极速构建？"
+        required: true
+        default: true
+      SPACE_NOCLEAN:
+        type: boolean
+        description: "是否停用空间清扫？"
+        required: true
+        default: false
+      BUILD_NOCCACHE:
+        type: boolean
+        description: "是否停用此次Ccache？"
+        required: true
+        default: false
+
+jobs:
+  build:
+    name: Build ${{ github.event.inputs.FILE }}
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_MAXSIZE: 8G
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Maximize Build Space
+        if: ${{ github.event.inputs.SPACE_NOCLEAN == 'false' }}
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Extract Manifest Info
+        id: extract_info
+        env:
+          FILE: ${{ github.event.inputs.FILE }}
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          if [[ "$FILE" =~ ^(.+)_([a-zA-Z])$ ]]; then
+            FILE_CONF="${BASH_REMATCH[1]}"
+          else
+            FILE_CONF="$FILE"
+          fi
+          FILE_BASE=$(echo "$FILE_CONF" | sed -E 's/_bak//g; /_aosp/{s/_aosp//g;s/$/(AOSP)/;}; s/_([a-zA-Z0-9])/\U\1/g; s/^oneplus/OnePlus/; s/^realme/RealME/; s/^oppo/OPPO/')
+          mkdir -p ".repo/manifests_fallback"
+          XML_PATH=".repo/manifests_fallback/${FILE}.xml"
+          README_PATH=".repo/manifests_fallback/README.md"
+          echo "处理 FILE=$FILE, CONF=$FILE_CONF, BASE=$FILE_BASE"
+          echo "FILE_CONF=$FILE_CONF" >> $GITHUB_ENV
+          echo "FILE_BASE=$FILE_BASE" >> $GITHUB_ENV
+
+          # 动态调用源码清单仓库
+          DYNAMIC_REPO_INPUT="${{ github.event.inputs.DYNAMIC_REPO }}"
+          declare -A REPOS
+          REPOS["OnePlusOSS"]="OnePlusOSS|kernel_manifest"
+          REPOS["Dynamic"]="${DYNAMIC_REPO_INPUT}|kernel_manifest"
+          REPOS["Appendix"]="Numbersf|Kernel_Manifest_Appendix"
+
+          FOUND_REPO=""
+          FOUND_BRANCH=""
+
+          check_repo() {
+            local ENTRY=$1
+            local OWNER=${ENTRY%%|*}
+            local REPO_NAME=${ENTRY##*|}
+
+            echo "🌐 尝试拉取 ${OWNER}/${REPO_NAME} 分支列表..."
+            BRANCHES=$(git ls-remote --heads https://github.com/${OWNER}/${REPO_NAME}.git | sed 's|.*refs/heads/||')
+
+            if [[ -z "$BRANCHES" ]]; then
+              echo "⚠️ ${OWNER}/${REPO_NAME} 分支列表获取失败"
+              return 1
+            fi
+            for BRANCH in $BRANCHES; do
+              XML_URL="https://raw.githubusercontent.com/${OWNER}/${REPO_NAME}/${BRANCH}/${FILE}.xml"
+              README_URL="https://raw.githubusercontent.com/${OWNER}/${REPO_NAME}/${BRANCH}/README.md"
+
+              if curl -sf --head "$XML_URL" >/dev/null; then
+                echo "✅ 在 ${OWNER}/${REPO_NAME} 找到 ${FILE}.xml (分支: ${BRANCH})"
+                curl -s -o "$XML_PATH" "$XML_URL"
+                curl -s -o "$README_PATH" "$README_URL" || true
+
+                FOUND_REPO="$OWNER"
+                FOUND_REPO_NAME="$REPO_NAME"
+                FOUND_BRANCH="$BRANCH"
+
+                return 0
+              fi
+            done
+            return 1
+          }
+          if ! check_repo "${REPOS["OnePlusOSS"]}"; then
+            if ! check_repo "${REPOS["Dynamic"]}"; then
+              check_repo "${REPOS["Appendix"]}"
+            fi
+          fi
+          if [[ -z "$FOUND_REPO" || ! -s "$XML_PATH" ]]; then
+            echo "❌ 无法在任何仓库中找到 ${FILE}.xml"
+            exit 9
+          fi
+          echo "MANIFEST_REPO=$FOUND_REPO" >> "$GITHUB_ENV"
+          echo "MANIFEST_REPO_NAME=$FOUND_REPO_NAME" >> "$GITHUB_ENV"
+          echo "MANIFEST_BRANCH=$FOUND_BRANCH" >> "$GITHUB_ENV"
+
+          # 解析 revision 字符串
+          REVISION=$(grep -oP '<project[^>]+revision="\K[^"]+' "$XML_PATH" | head -n1 || true)
+          CPU=$(echo "$REVISION" | sed -E 's#^(oneplus|realme|oppo)/([^_]+).*#\2#')
+          ANDROID_VERSION=$(echo "$REVISION" | grep -oP '\d{1,2}\.\d{1,2}(\.\d{1,2})?')
+          if [[ -n "$CPU" && -n "$ANDROID_VERSION" ]]; then
+            echo "✅ CPU=$CPU, ANDROID_VERSION=$ANDROID_VERSION"
+            echo "CPU=$CPU" >> $GITHUB_ENV
+            echo "ANDROID_VERSION=$ANDROID_VERSION" >> $GITHUB_ENV
+            echo "ANDROID_SHORT_VERSION=${ANDROID_VERSION%%.*}" >> $GITHUB_ENV
+          else
+            echo "❌ 无法从 revision 中提取 CPU 或 ANDROID_VERSION"
+            exit 1
+          fi
+
+          echo "解析 README.md 获取 CPUD 和 BUILD_METHOD..."
+          if [[ -s "$README_PATH" ]]; then
+            BUILD_LINE=$(grep -m1 'oplus_build_kernel.sh' "$README_PATH" || true)
+            if [[ -n "$BUILD_LINE" ]]; then
+              CPUD=$(echo "$BUILD_LINE" | awk '{print $(NF-1)}')
+              BUILD_METHOD=$(echo "$BUILD_LINE" | awk '{print $NF}')
+              echo "✅ CPUD=$CPUD, BUILD_METHOD=$BUILD_METHOD"
+              echo "CPUD=$CPUD" >> $GITHUB_ENV
+              echo "BUILD_METHOD=$BUILD_METHOD" >> $GITHUB_ENV
+            else
+              echo "❌ README.md 中未找到构建命令"
+            fi
+          else
+            echo "❌ README.md 下载失败或为空"
+          fi
+
+          echo "value=${FILE_BASE}_Android${ANDROID_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Debug Selected Inputs
+        run: |
+          echo "------------------------------"
+          echo "CPU: ${{ env.CPU }}"
+          echo "CPUD: ${{ env.CPUD }}"
+          echo "ANDROID_VERSION: ${{ env.ANDROID_VERSION }}"
+          echo "BUILD_METHOD: ${{ env.BUILD_METHOD }}"
+          echo "FILE: ${{ github.event.inputs.FILE }}"
+          echo "FAST_BUILD: ${{ github.event.inputs.FAST_BUILD }}"
+          echo "------------------------------"
+
+      - name: Check Disk Space
+        run: df -h
+
+      - name: Create and Enable 3G Swap
+        run: |
+          sudo swapoff -a
+          sudo fallocate -l 3G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Set Cache Environment
+        if: ${{ github.event.inputs.BUILD_NOCCACHE == 'false' }}
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache_${{ github.event.inputs.FILE }}" >> $GITHUB_ENV
+          mkdir -p "$HOME/.ccache_${{ github.event.inputs.FILE }}"
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "Numbersf"
+          git config --global user.email "263623064@qq.com"
+
+      - name: Install Dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: python3 git curl ccache libelf-dev build-essential flex bison libssl-dev libncurses-dev liblz4-tool zlib1g-dev libxml2-utils rsync unzip gawk dos2unix kmod libdw-dev elfutils
+          execute_install_scripts: true
+
+      - name: Restore Ccache
+        if: ${{ github.event.inputs.BUILD_NOCCACHE == 'false' }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.event.inputs.FILE }}-${{ env.BUILD_METHOD }}-${{ github.event.inputs.FAST_BUILD == 'true' && 'alpha' || 'beta' }}-stock
+
+      - name: Initialize Ccache
+        if: ${{ github.event.inputs.BUILD_NOCCACHE == 'false' }}
+        run: |
+          if command -v ccache >/dev/null 2>&1; then
+            mkdir -p "${{ env.CCACHE_DIR }}"
+            ccache -M ${{ env.CCACHE_MAXSIZE }}
+            echo "✅ ccache initialized"
+          fi
+          ccache -s
+
+      - name: Install Repo Tool
+        run: |
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod a+x ~/repo
+          sudo mv ~/repo /usr/local/bin/repo
+
+      - name: Initialize Repo and Sync
+        env:
+          FILE: ${{ github.event.inputs.FILE }}
+        run: |
+          mkdir kernel_workspace && cd kernel_workspace
+          mkdir -p .repo/manifests
+          cp "$GITHUB_WORKSPACE/.repo/manifests_fallback/${FILE}.xml" ".repo/manifests/${FILE}.xml"
+          BASE_URL="https://github.com/${MANIFEST_REPO}/${MANIFEST_REPO_NAME}.git"
+
+          echo "使用 $MANIFEST_REPO/$MANIFEST_REPO_NAME ($MANIFEST_BRANCH) 初始化仓库..."
+          repo init -u "$BASE_URL" -b "$MANIFEST_BRANCH" -m "${FILE}.xml" --depth=1 --no-clone-bundle --no-tags
+          repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync
+
+          KERNEL_REPOS=""
+          KERNEL_REPOS_PATH=$(find . -type f -name "build.config.msm.common" | head -n 1)
+          if [[ -n "$KERNEL_REPOS_PATH" ]]; then
+            KERNEL_REPOS=$(echo "${KERNEL_REPOS_PATH#./}" | cut -d/ -f2)
+            echo "✅ KERNEL_REPOS=$KERNEL_REPOS"
+            echo "KERNEL_REPOS=$KERNEL_REPOS" >> "$GITHUB_ENV"
+          else
+            echo "⚠️ 未找到 build.config.msm.common，可能是天玑或 Kleaf 构建"
+          fi
+
+          # 清理可能影响构建的 protected exports（可选）
+          for dir in kernel_platform/common kernel_platform/$KERNEL_REPOS; do
+            if [ -e "$dir/BUILD.bazel" ]; then
+              sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' "$dir/BUILD.bazel" || true
+            fi
+            rm -f "$dir/android/abi_gki_protected_exports_"* 2>/dev/null || true
+          done
+
+      - name: Kernel Version Handling
+        run: |
+          cd kernel_workspace/kernel_platform
+          # 获取内核 Android 版本号 (KANDROID_VERSION) 以及内核版本号 (KERNEL_VERSION)
+          for f in ./common/build.config.constants ./common/build.config.common; do
+            if [ -f "$f" ]; then
+              BRANCH=$(grep -m1 '^BRANCH=' "$f" | cut -d= -f2)
+              [ -n "$BRANCH" ] && break
+            fi
+          done
+          if [[ -z "$BRANCH" && -n "$KERNEL_REPOS" ]]; then
+            BRANCH=$(grep -m1 '^android' "./$KERNEL_REPOS/android/ACK_SHA" | cut -d- -f1,2)
+          fi
+          if [ -n "$BRANCH" ]; then
+            echo "KANDROID_VERSION=${BRANCH%-*}" >> $GITHUB_ENV
+            echo "KERNEL_VERSION=${BRANCH#*-}" >> $GITHUB_ENV
+          else
+            echo "No BRANCH found"
+          fi
+
+          ORIG_VERSION=$(awk '/^VERSION =/ {v=$3} /^PATCHLEVEL =/ {p=$3} /^SUBLEVEL =/ {s=$3} END {print v"."p"."s}' ./common/Makefile)
+          echo "Kernel Version: $ORIG_VERSION"
+          echo "TKERNEL_VERSION=$ORIG_VERSION" >> $GITHUB_ENV
+
+      - name: Build Kernel (Fast Mode)
+        if: ${{ github.event.inputs.FAST_BUILD == 'true' }}
+        id: fast_build
+        run: |
+          KERNEL_VERSION="${{ env.KERNEL_VERSION }}"
+          cd kernel_workspace/kernel_platform
+
+          # 检测 LLVM_IAS
+          USE_LLVM_IAS=false
+          if [[ -f ./common/build.config.arm ]] && grep -q '^LLVM_IAS=1' ./common/build.config.arm; then
+            USE_LLVM_IAS=true
+          fi
+
+          # 获取 Clang 路径
+          CLANG_PREBUILT_BIN=""
+          for f in ./common/build.config.common ./"$KERNEL_REPOS"/build.config.common; do
+            [[ -f "$f" ]] || continue
+            CLANG_PREBUILT_BIN=$(grep '^CLANG_PREBUILT_BIN=' "$f" | cut -d'=' -f2)
+            [[ -n "$CLANG_PREBUILT_BIN" ]] && break
+          done
+          if [[ -z "$CLANG_PREBUILT_BIN" ]]; then
+            echo "fallback=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$CLANG_PREBUILT_BIN" =~ (clang-r[0-9a-z]+) ]]; then
+            CLANG_VERSION="${BASH_REMATCH[1]}"
+          else
+            if [[ -f ./common/build.config.constants ]]; then
+              CLANG_VERSION=$(grep '^CLANG_VERSION=' ./common/build.config.constants | cut -d'=' -f2 || true)
+            fi
+          fi
+          if [[ -z "$CLANG_VERSION" ]]; then
+            echo "fallback=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CLANG_PREBUILT_BIN=${CLANG_PREBUILT_BIN/\$\{CLANG_VERSION\}/$CLANG_VERSION}
+          export PATH="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/$CLANG_PREBUILT_BIN:$PATH"
+          export PATH="/usr/lib/ccache:$PATH"
+
+          cd ./common
+
+          MAKE_ARGS=(
+            LLVM=1
+            ARCH=arm64
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CC="ccache clang"
+            HOSTCC="ccache clang"
+            LD=ld.lld
+            HOSTLD=ld.lld
+          )
+          if [[ "$USE_LLVM_IAS" == "true" ]]; then
+            MAKE_ARGS=(LLVM_IAS=1 "${MAKE_ARGS[@]}")
+          fi
+
+          make O=out "${MAKE_ARGS[@]}" gki_defconfig
+          make -j$(nproc) O=out "${MAKE_ARGS[@]}"
+          ccache -s
+
+      - name: Fallback to Official Build Script
+        if: ${{ github.event.inputs.FAST_BUILD == 'false' || steps.fast_build.outputs.fallback == 'true' }}
+        run: |
+          cd kernel_workspace
+          if [ -f ./kernel_platform/build_with_bazel.py ]; then
+            ./kernel_platform/oplus/bazel/oplus_modules_variant.sh ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
+            ./kernel_platform/build_with_bazel.py -t ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
+          else
+            LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 \
+            ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
+          fi
+
+      - name: Make AnyKernel3 Package
+        run: |
+          git clone https://github.com/Numbersf/AnyKernel3 --depth=1
+          rm -rf ./AnyKernel3/.git
+          mkdir -p kernel_workspace/kernel_platform/out/Final-Image-Find/
+
+          image_path=""
+          if [ -d "./kernel_workspace/kernel_platform/common/out/" ]; then
+            image_path=$(find "./kernel_workspace/kernel_platform/common/out/" -name "Image" | head -n 1)
+          fi
+          if [ -z "$image_path" ] && [ -d "./kernel_workspace/kernel_platform/out/" ]; then
+            image_path=$(find "./kernel_workspace/kernel_platform/out/" -name "Image" | head -n 1)
+          fi
+          if [ -z "$image_path" ]; then
+            echo "❌ 未找到 Image 文件"
+            exit 1
+          fi
+
+          echo "✅ Image found at: $image_path"
+          cp "$image_path" ./AnyKernel3/Image
+          cp "$image_path" kernel_workspace/kernel_platform/out/Final-Image-Find/Image
+
+      - name: Upload AnyKernel3 (Kernel Flashable Zip)
+        uses: actions/upload-artifact@v7
+        with:
+          name: AnyKernel3_Stock_${{ steps.extract_info.outputs.value }}_${{ env.TKERNEL_VERSION }}
+          path: ./AnyKernel3/*
+
+      - name: Post-build Disk Check
+        run: df -h
